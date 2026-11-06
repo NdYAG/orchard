@@ -1,0 +1,31 @@
+{
+  "name": "pi-orchard",
+  "version": "0.2.0",
+  "description": "pi extension for orchard, a warm git-worktree pool: /orchard new | done | status | prune.",
+  "license": "MIT",
+  "author": "Ximing Dai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NdYAG/orchard.git",
+    "directory": "extensions/pi"
+  },
+  "homepage": "https://github.com/NdYAG/orchard/tree/master/extensions/pi#readme",
+  "bugs": {
+    "url": "https://github.com/NdYAG/orchard/issues"
+  },
+  "keywords": ["pi-package", "worktree", "git"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "os": ["darwin", "linux"],
+  "files": [
+    "index.ts",
+    "bin/orchard",
+    "README.md",
+    "LICENSE"
+  ]
+}

@@ -2,5 +2,11 @@
   "name": "orchard",
   "version": "0.2.0",
   "description": "Warm git-worktree pool: new Claude Code worktrees reuse plots whose dependencies are already installed.",
+  "author": {
+    "name": "Ximing Dai"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/NdYAG/orchard",
+  "repository": "https://github.com/NdYAG/orchard",
   "keywords": ["worktree", "git", "hooks"]
 }

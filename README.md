@@ -20,20 +20,18 @@ One repository, one version number, three parts you can install independently:
 
 | Part | Where | What it is |
 |---|---|---|
-| CLI | `bin/orchard` | The core. Works from any shell or agent. Single-file Python 3, standard library only. |
+| CLI | `bin/orchard` | The core. Works from any shell or agent. Single-file Python 3, standard library only. On npm as `@ndyag/orchard`. |
 | Claude Code plugin | `plugins/claude-code` | Takes over `WorktreeCreate` / `WorktreeRemove` and adds `/orchard`. Bundles its own copy of the CLI. |
-| pi extension | `extensions/pi` | Adds `/orchard new \| done \| status \| prune` and moves your pi session into a plot. |
+| pi extension | `extensions/pi` | Adds `/orchard new \| done \| status \| prune` and moves your pi session into a plot. On npm as `pi-orchard`, with its own copy of the CLI. |
 
 **Requirements:** Python 3 (tested on 3.9 and 3.10) and git. [`gh`](https://cli.github.com/) is optional; it is used to check whether a branch's pull request is merged. Tested on macOS only; Windows is not supported (it uses `fcntl` and `ps`).
 
 ## Install
 
-> orchard is not published yet. The commands below assume it will live at `<owner>/orchard`; until then, install from a local checkout.
-
 **Claude Code**
 
 ```sh
-claude plugin marketplace add <owner>/orchard
+claude plugin marketplace add NdYAG/orchard
 claude plugin install orchard@orchard
 ```
 
@@ -42,16 +40,18 @@ From a checkout, without installing anything: `claude --plugin-dir plugins/claud
 **pi**
 
 ```sh
-pi install git:github.com/<owner>/orchard
+pi install npm:pi-orchard
 ```
 
-From a checkout: `pi -e ./extensions/pi/index.ts`.
+Or straight from the repository: `pi install git:github.com/NdYAG/orchard`. From a checkout: `pi -e ./extensions/pi/index.ts`.
 
 **Command line**
 
 ```sh
-scripts/install.sh        # symlinks bin/orchard into ~/.local/bin
+npm install -g @ndyag/orchard
 ```
+
+Or from a checkout: `scripts/install.sh` symlinks `bin/orchard` into `~/.local/bin`.
 
 ## Configure a repository
 
@@ -151,19 +151,32 @@ Files outside the repository: `~/.config/orchard/repos.json` and `~/.cache/orcha
 ## Development
 
 ```sh
-tests/smoke.sh                     # 38 checks against a throwaway repo in /tmp/orchard-test
+tests/smoke.sh                     # 54 checks against a throwaway repo in /tmp/orchard-test
 python3 tests/pi-e2e.py            # pi extension through `pi --mode rpc`, no model calls (run smoke.sh first)
 tests/claude-e2e.sh ask "…"        # real Claude Code session; ORCHARD_INSTALLED=1 uses the installed plugin
-scripts/sync-cli.sh [--check]      # keep the plugin's copy of the CLI in sync
+scripts/sync-cli.sh [--check]      # keep the bundled copies of the CLI in sync
 scripts/release.sh 0.3.0           # bump every version string, sync, test
 ```
 
-An installed Claude Code plugin is copied on its own into Claude Code's cache, where it can't reach the repository root, so `plugins/claude-code/bin/orchard` is a copy of `bin/orchard`. After editing the CLI run `scripts/sync-cli.sh`; `--check` also verifies that every manifest carries the same version as `__version__` in `bin/orchard`.
+An installed Claude Code plugin is copied on its own into Claude Code's cache, and `pi-orchard` is published from its own directory, so neither can reach the repository root: `plugins/claude-code/bin/orchard` and `extensions/pi/bin/orchard` are copies of `bin/orchard`. After editing the CLI run `scripts/sync-cli.sh`; `--check` also verifies that every manifest carries the same version as `__version__` in `bin/orchard`.
+
+### Releasing
+
+```sh
+scripts/release.sh 0.3.0           # bump every version, sync the copies, run the checks; then edit CHANGELOG.md
+git commit -am "Release 0.3.0" && git tag v0.3.0 && git push --follow-tags
+npm publish                        # @ndyag/orchard
+(cd extensions/pi && npm publish)  # pi-orchard
+```
 
 ### Tested
 
-Claude Code 2.1.318 and pi 1.5.0 on macOS. Worktrees outside the repository (`worktrees_dir`) were exercised with both Claude Code and pi, creating and removing. Not yet verified: installing the plugin from a GitHub marketplace (only a local-path marketplace has been exercised), and whether bumping the version updates an installed plugin.
+Claude Code 2.1.318 and pi 1.5.0 on macOS. Worktrees outside the repository (`worktrees_dir`) were exercised with both Claude Code and pi, creating and removing. Installing from GitHub was exercised for both: `claude plugin marketplace add NdYAG/orchard` followed by `claude plugin install`, and `pi -e git:github.com/NdYAG/orchard`; the packed `pi-orchard` tarball was also run on its own. Not yet verified: whether bumping the version updates an installed plugin.
 
 ## Status
 
-Early. The interfaces above are what the tests cover; expect rough edges. No license has been chosen yet.
+Early. The interfaces above are what the tests cover; expect rough edges.
+
+## License
+
+[MIT](LICENSE)

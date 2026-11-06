@@ -1,0 +1,751 @@
+#!/usr/bin/env python3
+"""orchard: a warm git-worktree pool, usable from any agent or shell.
+
+Core commands (agent-neutral):
+  claim <name>         create or reuse <worktrees_dir>/<name>; prints its path. The directory defaults to
+                       <repo>/.claude/worktrees (Claude Code) or <repo>/.pi/worktrees (--agent pi).
+  release <path>       park a pooled worktree as fallow instead of deleting it.
+  disown <path>        the owner moved on but is still alive; let reclaim judge the worktree.
+  run <name> -- cmd    claim, then exec cmd inside the worktree (cmd becomes the owner).
+  status / prune       list plots / reclaim finished plots of ended owners.
+Adapter:
+  hook claude-create|claude-remove   Claude Code WorktreeCreate/WorktreeRemove (JSON on stdin).
+
+stdout carries only the result (path or JSON); step output goes to the log, messages to stderr.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+
+__version__ = "0.2.0"  # keep in step with package.json and the plugin manifests: scripts/sync-cli.sh --check
+
+HOME = Path.home()
+# ORCHARD_* overrides exist for tests; XDG vars are shared with other tools (e.g. credential stores).
+CACHE_ROOT = Path(os.environ.get("ORCHARD_CACHE_DIR")
+                  or Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache") / "orchard")
+CONFIG_PATH = Path(os.environ.get("ORCHARD_CONFIG")
+                   or Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "orchard" / "repos.json")
+DEFAULTS = {"fingerprint": [], "prepare": "", "max_plots": 4, "base": "", "fetch_ttl_minutes": 10}
+# Where each agent keeps worktrees by default (Claude Code's own location for its users). A caller that
+# says nothing, or something unknown, gets the first; `worktrees_dir` in the config overrides all of them.
+DEFAULT_WORKTREES_DIR = ".claude/worktrees"
+AGENT_WORKTREES_DIRS = {"claude-code": ".claude/worktrees", "claude": ".claude/worktrees", "pi": ".pi/worktrees"}
+FALLOW = ".fallow"
+STALE_RECHECK_SECONDS = 600
+# Claude Code's own worktree lock reason, e.g. "claude session foo (pid 123 start Tue Nov  3 06:15:21 2026)".
+CLAUDE_LOCK_RE = re.compile(r"claude session .*\(pid (\d+) start (.+)\)")
+
+
+class OrchardError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- helpers
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def eprint(msg: str) -> None:
+    print(f"[orchard] {msg}", file=sys.stderr, flush=True)
+
+
+def run(cwd, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    proc = subprocess.run(list(args), cwd=str(cwd), capture_output=True, text=True)
+    if check and proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
+        raise OrchardError(f"`{' '.join(args)}` failed in {cwd}: {detail}")
+    return proc
+
+
+def git(cwd, *args: str, check: bool = True) -> str:
+    return run(cwd, "git", *args, check=check).stdout.strip()
+
+
+def git_ok(cwd, *args: str) -> bool:
+    return run(cwd, "git", *args, check=False).returncode == 0
+
+
+def process_start(pid: int | None) -> str | None:
+    if not pid:
+        return None
+    out = run("/", "ps", "-o", "lstart=", "-p", str(pid), check=False).stdout
+    return " ".join(out.split()) or None
+
+
+def alive(pid: int | None, started: str | None) -> bool:
+    # Compare start time too, so a recycled PID does not look like the original process.
+    current = process_start(pid)
+    return current is not None and started is not None and current == " ".join(started.split())
+
+
+def worktree_list(cwd) -> list[dict]:
+    entries: list[dict] = []
+    for line in git(cwd, "worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            entries.append({"path": line[len("worktree "):], "branch": None, "locked": None})
+        elif not entries:
+            continue
+        elif line.startswith("branch "):
+            entries[-1]["branch"] = line[len("branch "):].removeprefix("refs/heads/")
+        elif line == "locked" or line.startswith("locked "):
+            entries[-1]["locked"] = line[len("locked "):] if line.startswith("locked ") else ""
+    return entries
+
+
+def same_path(a, b) -> bool:
+    return os.path.realpath(str(a)) == os.path.realpath(str(b))
+
+
+# ---------------------------------------------------------------- repository + config
+
+def resolve_worktrees_dir(root: Path, setting: str | None, agent: str | None = None) -> Path:
+    """`~`, `{repo}` (the checkout's directory name) and paths relative to the checkout are understood."""
+    raw = (setting or AGENT_WORKTREES_DIRS.get(agent or "", DEFAULT_WORKTREES_DIR)).replace("{repo}", root.name)
+    path = Path(os.path.expanduser(raw))
+    path = Path(os.path.realpath(path if path.is_absolute() else root / path))
+    git_dir = root / ".git"
+    if path == root or path in root.parents:
+        raise OrchardError(f"worktrees_dir {raw!r} is the repository or contains it")
+    if path == git_dir or git_dir in path.parents:
+        raise OrchardError(f"worktrees_dir {raw!r} is inside .git")
+    return path
+
+
+class Repo:
+    def __init__(self, cwd, agent: str | None = None):
+        top = git(cwd, "rev-parse", "--show-toplevel")
+        self.root = Path(os.path.realpath(worktree_list(top)[0]["path"]))
+        digest = hashlib.sha256(str(self.root).encode()).hexdigest()[:16]
+        self.state_dir = CACHE_ROOT / f"{self.root.name}-{digest}"
+        self.config = load_config(self.root)
+        self.worktrees_dir = resolve_worktrees_dir(self.root, (self.config or {}).get("worktrees_dir"), agent)
+        self.fallow_dir = self.worktrees_dir / FALLOW
+
+    def fallow_dir_for(self, path) -> Path:
+        """Where to park `path`: the configured directory if there is one, else beside where it sits now, so a
+        command that doesn't know the agent (a manual `release`, `prune`) can't strew plots over several defaults."""
+        if (self.config or {}).get("worktrees_dir"):
+            return self.fallow_dir
+        here = Path(path).parent
+        return here if here.name == FALLOW else here / FALLOW
+
+    def log(self, msg: str, **ctx) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.state_dir / "orchard.log", "a") as fh:
+            fh.write(json.dumps({"at": now_iso(), "pid": os.getpid(), "msg": msg, **ctx}) + "\n")
+
+    def base(self) -> str:
+        if self.config and self.config.get("base"):
+            return self.config["base"]
+        ref = git(self.root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD", check=False)
+        return ref.removeprefix("refs/remotes/") if ref else "HEAD"
+
+    def worktree_entry(self, path) -> dict | None:
+        return next((e for e in worktree_list(self.root) if same_path(e["path"], path)), None)
+
+    def unlock(self, path) -> None:
+        entry = self.worktree_entry(path)
+        if entry and entry["locked"] is not None:
+            git(self.root, "worktree", "unlock", str(path), check=False)
+
+
+def load_config(root: Path) -> dict | None:
+    if not CONFIG_PATH.exists():
+        return None
+    try:
+        repos = json.loads(CONFIG_PATH.read_text())
+    except json.JSONDecodeError as err:
+        raise OrchardError(f"{CONFIG_PATH} is not valid JSON: {err}") from err
+    for key, value in repos.items():
+        if same_path(os.path.expanduser(key), root):
+            config = {**DEFAULTS, **value}
+            if "steps" not in config:
+                # Single-step shorthand: {"fingerprint": [...], "prepare": "..."}.
+                config["steps"] = [{"name": "prepare", "fingerprint": config["fingerprint"],
+                                    "run": config["prepare"]}] if config["prepare"] else []
+            return config
+    return None
+
+
+def step_fingerprints(cwd, ref: str, config: dict) -> dict[str, str]:
+    """Per-step fingerprint from the git object ids (blob or tree) of its paths at `ref`, plus its command."""
+    result = {}
+    for step in config["steps"]:
+        digest = hashlib.sha256(step["run"].encode() + b"\0")
+        for name in step.get("fingerprint", []):
+            oid = git(cwd, "rev-parse", "--verify", "--quiet", f"{ref}:{name}", check=False) or "<missing>"
+            digest.update(f"{name}\0{oid}\0".encode())
+        result[step["name"]] = "sha256:" + digest.hexdigest()[:32]
+    return result
+
+
+def combined(fps: dict[str, str]) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(fps, sort_keys=True).encode()).hexdigest()[:32]
+
+
+def steps_to_run(config: dict, have: dict | None, want: dict[str, str]) -> list[dict]:
+    """The first step whose fingerprint changed, and every step after it."""
+    have = have or {}
+    for index, step in enumerate(config["steps"]):
+        if have.get(step["name"]) != want[step["name"]]:
+            return config["steps"][index:]
+    return []
+
+
+# ---------------------------------------------------------------- pool state
+
+def load_pool(repo: Repo) -> dict:
+    path = repo.state_dir / "pool.json"
+    if path.exists():
+        return json.loads(path.read_text())
+    return {"version": 1, "root": str(repo.root), "last_fetch": 0, "plots": []}
+
+
+def save_pool(repo: Repo, pool: dict) -> None:
+    path = repo.state_dir / "pool.json"
+    tmp = path.with_suffix(f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(pool, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def locked_pool(repo: Repo):
+    """Exclusive pool access; saves on clean exit only, so a failed mutation leaves the pool untouched."""
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    with open(repo.state_dir / "pool.lock", "a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        pool = load_pool(repo)
+        yield pool
+        save_pool(repo, pool)
+
+
+def find_plot(pool: dict, plot_id: str) -> dict | None:
+    return next((p for p in pool["plots"] if p["id"] == plot_id), None)
+
+
+def next_plot_id(pool: dict) -> str:
+    used = [int(p["id"][1:]) for p in pool["plots"] if re.fullmatch(r"p\d+", p["id"])]
+    return f"p{max(used, default=0) + 1}"
+
+
+def drop_missing(repo: Repo, pool: dict) -> None:
+    missing = [p for p in pool["plots"] if p.get("path") and not Path(p["path"]).exists()
+               and p["state"] != "preparing"]
+    if missing:
+        git(repo.root, "worktree", "prune", check=False)
+        for plot in missing:
+            repo.log("dropping plot whose directory is gone", plot=plot["id"], path=plot["path"])
+            pool["plots"].remove(plot)
+
+
+def plot_is_busy(repo: Repo, plot: dict, entries: list[dict]) -> bool:
+    if plot["state"] == "preparing":
+        claimer = plot.get("claimer") or {}
+        return alive(claimer.get("pid"), claimer.get("pid_started"))
+    owner = plot.get("owner") or {}
+    if alive(owner.get("pid"), owner.get("pid_started")):
+        return True
+    entry = next((e for e in entries if same_path(e["path"], plot["path"])), None)
+    match = CLAUDE_LOCK_RE.search((entry or {}).get("locked") or "")
+    return bool(match) and alive(int(match.group(1)), match.group(2))
+
+
+# ---------------------------------------------------------------- plot operations
+
+def to_fallow(repo: Repo, path: Path, plot_id: str, name: str, backup: bool) -> Path:
+    """Detach and park a plot under .fallow/<id>. Uncommitted work is saved under refs/orchard/backup/."""
+    repo.unlock(path)
+    if git(path, "status", "--porcelain"):
+        if not backup:
+            raise OrchardError(f"{path} has uncommitted changes")
+        git(path, "add", "-A")
+        sha = git(path, "stash", "create", f"orchard backup of {name}")
+        if sha:
+            ref = f"refs/orchard/backup/{name}-{time.strftime('%Y%m%d%H%M%S')}"
+            git(path, "update-ref", ref, sha)
+            repo.log("backed up uncommitted changes", plot=plot_id, ref=ref)
+            eprint(f"uncommitted changes saved to {ref}")
+        git(path, "reset", "--hard", "--quiet")
+        git(path, "clean", "-fd", "--quiet")
+    git(path, "switch", "--detach", "--quiet")
+    park = repo.fallow_dir_for(path)
+    dest = park / plot_id
+    if not same_path(path, dest):
+        park.mkdir(parents=True, exist_ok=True)
+        git(repo.root, "worktree", "move", str(path), str(dest))
+    return dest
+
+
+def run_step(repo: Repo, path: Path, step: dict, plot_id: str) -> None:
+    started = time.time()
+    eprint(f"{path.name}: running step {step['name']}")
+    with open(repo.state_dir / "orchard.log", "a") as log:
+        log.write(f"--- step {step['name']} for {plot_id} in {path} at {now_iso()}: {step['run']}\n")
+        log.flush()
+        proc = subprocess.run(["sh", "-c", step["run"]], cwd=str(path), stdout=log, stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        raise OrchardError(f"step {step['name']} failed (exit {proc.returncode}); "
+                           f"see {repo.state_dir / 'orchard.log'}")
+    repo.log("step done", plot=plot_id, step=step["name"], seconds=round(time.time() - started, 1))
+
+
+def switch_branch(path: Path, branch: str, exists: bool, base: str) -> None:
+    if exists:
+        git(path, "switch", "--quiet", branch)
+    else:
+        # --no-track: a new task branch must not inherit origin/master as its upstream.
+        git(path, "switch", "--quiet", "--no-track", "-c", branch, base)
+
+
+def add_plain_worktree(repo: Repo, target: Path, branch: str, exists: bool, base: str) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if exists:
+        git(repo.root, "worktree", "add", "--quiet", str(target), branch)
+    else:
+        git(repo.root, "worktree", "add", "--quiet", "--no-track", "-b", branch, str(target), base)
+
+
+def verdict(repo: Repo, plot: dict) -> tuple[bool, str]:
+    """Is the work in a dead session's plot finished? (safe, reason). Branches are never deleted."""
+    if plot["state"] == "preparing":
+        return True, "claim was interrupted"
+    path = Path(plot["path"])
+    if git(path, "status", "--porcelain"):
+        return False, "uncommitted changes"
+    base = repo.base()
+    if git_ok(path, "merge-base", "--is-ancestor", "HEAD", base):
+        return True, f"contained in {base}"
+    branch = git(path, "branch", "--show-current", check=False)
+    if not branch:
+        if git(path, "branch", "-r", "--contains", "HEAD", check=False):
+            return True, "detached at a pushed commit"
+        return False, "detached HEAD with local-only commits"
+    proc = run(path, "gh", "pr", "list", "--head", branch, "--state", "all",
+               "--json", "number,state", "--limit", "1", check=False)
+    if proc.returncode != 0:
+        return False, "PR state unknown (gh failed)"
+    prs = json.loads(proc.stdout or "[]")
+    if not prs:
+        return False, "no PR for branch"
+    pr = prs[0]
+    if pr["state"] in ("MERGED", "CLOSED"):
+        return True, f"PR #{pr['number']} {pr['state'].lower()}"
+    return False, f"PR #{pr['number']} open"
+
+
+def reclaim(repo: Repo, dry_run: bool = False, force_check: bool = False) -> list[dict]:
+    """Return finished plots of ended sessions to fallow. Slow checks (gh) run outside the lock."""
+    with locked_pool(repo) as pool:
+        drop_missing(repo, pool)
+        entries = worktree_list(repo.root)
+        candidates = []
+        for plot in pool["plots"]:
+            if plot["state"] not in ("occupied", "preparing", "stale"):
+                continue
+            checked = (plot.get("stale") or {}).get("checked_ts", 0)
+            if not force_check and plot["state"] == "stale" and time.time() - checked < STALE_RECHECK_SECONDS:
+                continue
+            if not plot_is_busy(repo, plot, entries):
+                candidates.append(dict(plot))
+
+    results = []
+    for plot in candidates:
+        try:
+            safe, reason = verdict(repo, plot)
+        except OrchardError as err:
+            safe, reason = False, str(err)
+        result = {"id": plot["id"], "name": plot.get("name"), "safe": safe, "reason": reason}
+        results.append(result)
+        if dry_run:
+            continue
+        new_path = None
+        if safe:
+            try:
+                new_path = to_fallow(repo, Path(plot["path"]), plot["id"], plot.get("name") or plot["id"],
+                                     backup=plot["state"] == "preparing")
+            except OrchardError as err:
+                result.update(safe=False, reason=f"could not park: {err}")
+        with locked_pool(repo) as pool:
+            current = find_plot(pool, plot["id"])
+            if current is None or current.get("claimed_at") != plot.get("claimed_at"):
+                continue  # someone else changed it meanwhile
+            if new_path:
+                interrupted = plot["state"] == "preparing"
+                current.update(state="fallow", path=str(new_path), owner=None, claimer=None, stale=None,
+                               released_ts=time.time())
+                if interrupted:
+                    current.update(fingerprint=None, steps={})
+                repo.log("reclaimed", plot=plot["id"], reason=reason)
+            else:
+                current.update(state="stale", stale={"reason": result["reason"], "checked_ts": time.time()})
+    return results
+
+
+def trim_excess(repo: Repo, pool: dict) -> None:
+    if repo.config is None:
+        return
+    limit = int(repo.config["max_plots"])
+    fallow = sorted((p for p in pool["plots"] if p["state"] == "fallow"), key=lambda p: p.get("released_ts", 0))
+    while len(pool["plots"]) > limit and fallow:
+        plot = fallow.pop(0)
+        git(repo.root, "worktree", "remove", "--force", plot["path"], check=False)
+        pool["plots"].remove(plot)
+        repo.log("removed excess fallow plot", plot=plot["id"])
+
+
+# ---------------------------------------------------------------- hook commands
+
+def read_payload() -> dict:
+    raw = sys.stdin.read()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as err:
+        raise OrchardError(f"hook input is not JSON: {err}") from err
+
+
+def reserve(repo: Repo, want: dict[str, str], owner: dict, name: str, allow_plant: bool):
+    with locked_pool(repo) as pool:
+        drop_missing(repo, pool)
+        fallow = [p for p in pool["plots"] if p["state"] == "fallow"]
+        if fallow:
+            # Prefer the plot needing the fewest steps, then the most recently released one.
+            fallow.sort(key=lambda p: (len(steps_to_run(repo.config, p.get("steps"), want)),
+                                       -p.get("released_ts", 0)))
+            plot, planted = fallow[0], False
+        elif allow_plant and len(pool["plots"]) < int(repo.config["max_plots"]):
+            plot = {"id": next_plot_id(pool), "path": None, "fingerprint": None, "steps": {},
+                    "created_at": now_iso()}
+            pool["plots"].append(plot)
+            planted = True
+        else:
+            return None
+        plot.update(state="preparing", owner=owner, name=name, claimed_at=now_iso(), stale=None,
+                    claimer={"pid": os.getpid(), "pid_started": process_start(os.getpid())})
+        return dict(plot), planted
+
+
+# ---------------------------------------------------------------- core operations (agent-neutral)
+
+def make_owner(pid: int, session_id: str | None = None, agent: str | None = None) -> dict:
+    return {"pid": pid, "pid_started": process_start(pid), "session_id": session_id, "agent": agent}
+
+
+def validate_name(name: str | None) -> str:
+    if not name or "/" in name or name.startswith(".") or name != name.strip():
+        raise OrchardError(f"unusable worktree name {name!r}")
+    return name
+
+
+def claim(repo_dir, name: str, owner: dict, unconfigured_branch: str | None = None) -> dict:
+    """Put a worktree named `name` at <worktrees_dir>/<name>, served from the pool when configured."""
+    repo = Repo(repo_dir, agent=owner.get("agent"))
+    target = repo.worktrees_dir / validate_name(name)
+    if target.exists():
+        raise OrchardError(f"{target} already exists")
+
+    if repo.config is None:
+        branch = unconfigured_branch or name
+        exists = git_ok(repo.root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
+        add_plain_worktree(repo, target, branch, exists, repo.base())
+        return {"path": str(target), "branch": branch, "pooled": False, "plot": None, "planted": False, "ran": []}
+
+    config = repo.config
+    if time.time() - load_pool(repo).get("last_fetch", 0) > float(config["fetch_ttl_minutes"]) * 60:
+        if git_ok(repo.root, "fetch", "--quiet", "origin"):
+            with locked_pool(repo) as pool:
+                pool["last_fetch"] = time.time()
+        else:
+            eprint("git fetch failed; using local refs")
+
+    base = repo.base()
+    branch = name
+    exists = git_ok(repo.root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")
+    if exists and any(e["branch"] == branch for e in worktree_list(repo.root)):
+        raise OrchardError(f"branch {branch} is already checked out in another worktree")
+    want = step_fingerprints(repo.root, branch if exists else base, config)
+
+    reserved = reserve(repo, want, owner, name, allow_plant=False)
+    if reserved is None:
+        reclaim(repo)
+        reserved = reserve(repo, want, owner, name, allow_plant=True)
+    if reserved is None:
+        eprint(f"all {config['max_plots']} plots are busy; creating a plain worktree without dependencies")
+        repo.log("pool exhausted; plain worktree", name=name)
+        add_plain_worktree(repo, target, branch, exists, base)
+        return {"path": str(target), "branch": branch, "pooled": False, "plot": None, "planted": False, "ran": []}
+
+    plot, planted = reserved
+    # Steps recorded as done; a step about to run (and everything after it) is invalidated first,
+    # so a failure part-way leaves an accurate record for the next claim.
+    done = {} if planted else dict(plot.get("steps") or {})
+    to_run = config["steps"] if planted else steps_to_run(config, done, want)
+    try:
+        if planted:
+            add_plain_worktree(repo, target, branch, exists, base)
+        else:
+            repo.unlock(plot["path"])
+            target.parent.mkdir(parents=True, exist_ok=True)  # `worktree move` won't create it (a new worktrees_dir)
+            git(repo.root, "worktree", "move", plot["path"], str(target))
+            switch_branch(target, branch, exists, base)
+        for step in to_run:
+            done.pop(step["name"], None)
+        for step in to_run:
+            run_step(repo, target, step, plot["id"])
+            done[step["name"]] = want[step["name"]]
+        if not planted and not to_run:
+            eprint(f"reused plot {plot['id']} for {name}; every step is up to date")
+    except Exception as err:
+        repo.log("claim failed", plot=plot["id"], err=str(err))
+        with locked_pool(repo) as pool:
+            current = find_plot(pool, plot["id"])
+            if planted:
+                if target.exists():
+                    git(repo.root, "worktree", "remove", "--force", str(target), check=False)
+                if current:
+                    pool["plots"].remove(current)
+            elif current:
+                where = target if target.exists() else Path(plot["path"])
+                try:
+                    dest = to_fallow(repo, where, plot["id"], name, backup=False)
+                    current.update(state="fallow", path=str(dest), owner=None, claimer=None,
+                                   released_ts=time.time(), steps=done, fingerprint=None)
+                except Exception as park_err:  # noqa: BLE001 - keep the original error
+                    current.update(state="broken", error=f"{err}; then {park_err}")
+        if not exists:
+            git(repo.root, "branch", "-D", branch, check=False)
+        raise
+
+    with locked_pool(repo) as pool:
+        current = find_plot(pool, plot["id"])
+        current.update(state="occupied", path=str(target), branch=branch, steps=done,
+                       fingerprint=combined(done), claimer=None)
+        if to_run:
+            current["prepared_at"] = now_iso()
+    ran = [s["name"] for s in to_run]
+    repo.log("claimed", plot=plot["id"], name=name, planted=planted, ran=ran, agent=owner.get("agent"))
+    return {"path": str(target), "branch": branch, "pooled": True, "plot": plot["id"], "planted": planted, "ran": ran}
+
+
+def release(path: Path) -> dict:
+    """Park a pooled worktree as fallow (backing up uncommitted work); remove an unpooled one."""
+    if not path.exists():
+        # Nothing to park; a stale pool entry is dropped by the next claim. Also keeps this from needing a
+        # repository to run in: the worktree may live outside it and be gone.
+        return {"action": "absent", "plot": None, "path": None}
+    repo = Repo(path)
+    with locked_pool(repo) as pool:
+        plot = next((p for p in pool["plots"] if p.get("path") and same_path(p["path"], path)), None)
+        snapshot = dict(plot) if plot else None
+    if snapshot is None:
+        repo.unlock(path)
+        git(repo.root, "worktree", "remove", "--force", str(path))
+        return {"action": "removed", "plot": None, "path": None}
+    dest = to_fallow(repo, path, snapshot["id"], snapshot.get("name") or snapshot["id"], backup=True)
+    with locked_pool(repo) as pool:
+        current = find_plot(pool, snapshot["id"])
+        if current:
+            current.update(state="fallow", path=str(dest), owner=None, claimer=None, stale=None,
+                           released_ts=time.time())
+        trim_excess(repo, pool)
+    repo.log("released", plot=snapshot["id"], name=snapshot.get("name"))
+    return {"action": "fallow", "plot": snapshot["id"], "path": str(dest)}
+
+
+def disown(path: Path) -> dict:
+    """The owner left this worktree but lives on: let reclaim judge it as if its session had ended."""
+    if not path.exists():
+        return {"plot": None}
+    repo = Repo(path)
+    with locked_pool(repo) as pool:
+        plot = next((p for p in pool["plots"] if p.get("path") and same_path(p["path"], path)), None)
+        if plot is None:
+            return {"plot": None}
+        if plot["state"] == "occupied":
+            plot["owner"] = None
+        plot_id = plot["id"]
+    repo.log("disowned", plot=plot_id)
+    return {"plot": plot_id}
+
+
+def plot_rows(repo: Repo) -> list[dict]:
+    pool = load_pool(repo)
+    want = step_fingerprints(repo.root, repo.base(), repo.config)
+    entries = worktree_list(repo.root)
+    rows = []
+    for plot in pool["plots"]:
+        ended = plot["state"] in ("occupied", "preparing") and bool(plot.get("path")) \
+            and Path(plot["path"]).exists() and not plot_is_busy(repo, plot, entries)
+        parked = plot["state"] == "fallow"
+        rows.append({
+            "id": plot["id"], "state": plot["state"], "session_ended": ended,
+            "name": None if parked else plot.get("name"), "branch": None if parked else plot.get("branch"),
+            "path": plot.get("path"), "agent": (plot.get("owner") or {}).get("agent"),
+            "owner_pid": (plot.get("owner") or {}).get("pid"),
+            "pending_steps": [s["name"] for s in steps_to_run(repo.config, plot.get("steps"), want)],
+            "note": (plot.get("stale") or {}).get("reason") or plot.get("error"),
+        })
+    return rows
+
+
+# ---------------------------------------------------------------- CLI
+
+def emit(result: dict, as_json: bool, text: str) -> None:
+    print(json.dumps(result) if as_json else text)
+
+
+def cmd_claim(args) -> None:
+    result = claim(args.repo, args.name, make_owner(args.owner_pid, args.session_id, args.agent))
+    emit(result, args.json, result["path"])
+
+
+def cmd_release(args) -> None:
+    result = release(Path(args.path))
+    emit(result, args.json, f"{result['action']}: {result['path'] or args.path}")
+
+
+def cmd_disown(args) -> None:
+    result = disown(Path(args.path))
+    emit(result, args.json, f"disowned {result['plot']}" if result["plot"] else "not a pooled worktree")
+
+
+def cmd_run(args) -> None:
+    command = args.command_line
+    if not command:
+        raise OrchardError("usage: orchard run <name> -- <command> [args...]")
+    # exec keeps this PID, so the launched agent itself becomes the plot's owner.
+    result = claim(args.repo, args.name, make_owner(os.getpid(), None, args.agent or Path(command[0]).name))
+    os.chdir(result["path"])
+    os.environ["ORCHARD_WORKTREE"] = result["path"]
+    sys.stdout.flush()
+    os.execvp(command[0], command)
+
+
+def cmd_status(args) -> None:
+    repo = Repo(args.repo, agent=args.agent)
+    if repo.config is None:
+        emit({"configured": False, "root": str(repo.root), "worktrees_dir": str(repo.worktrees_dir), "plots": []},
+             args.json, f"{repo.root} is not configured in {CONFIG_PATH}; worktrees are created the default way.")
+        return
+    rows = plot_rows(repo)
+    if args.json:
+        print(json.dumps({"configured": True, "root": str(repo.root), "worktrees_dir": str(repo.worktrees_dir),
+                          "base": repo.base(), "max_plots": repo.config["max_plots"], "plots": rows}))
+        return
+    table = [("ID", "STATE", "NAME", "BRANCH", "VS BASE", "NOTE")]
+    for r in rows:
+        table.append((r["id"], r["state"] + ("*" if r["session_ended"] else ""), r["name"] or "", r["branch"] or "",
+                      "fresh" if not r["pending_steps"] else "needs " + ",".join(r["pending_steps"]), r["note"] or ""))
+    widths = [max(len(str(row[i])) for row in table) for i in range(len(table[0]))]
+    for row in table:
+        print("  ".join(str(v).ljust(w) for v, w in zip(row, widths)).rstrip())
+    print(f"\n{len(rows)}/{repo.config['max_plots']} plots in {repo.worktrees_dir} · steps vs {repo.base()} · * = session ended")
+
+
+def cmd_prune(args) -> None:
+    repo = Repo(args.repo)
+    if repo.config is None:
+        print(f"{repo.root} is not configured in {CONFIG_PATH}.")
+        return
+    results = reclaim(repo, dry_run=args.dry_run, force_check=True)
+    if not args.dry_run:
+        with locked_pool(repo) as pool:
+            trim_excess(repo, pool)
+    if args.json:
+        print(json.dumps({"results": results}))
+        return
+    if not results:
+        print("nothing to reclaim: every non-fallow plot belongs to a live session")
+    for r in results:
+        action = ("would reclaim" if args.dry_run else "reclaimed") if r["safe"] else "kept"
+        print(f"{r['id']:<5} {r.get('name') or '':<32} {action}: {r['reason']}")
+
+
+# ---------------------------------------------------------------- Claude Code hook adapter
+
+def cmd_hook(args) -> None:
+    """Claude Code WorktreeCreate/WorktreeRemove: JSON on stdin; Create prints the path on stdout."""
+    payload = read_payload()
+    if args.event == "claude-create":
+        pid = int(os.environ.get("CLAUDE_PID") or os.getppid())
+        name = validate_name(payload.get("name"))
+        # Unconfigured repos mimic Claude Code's own default branch naming.
+        result = claim(payload.get("cwd") or os.getcwd(), name,
+                       make_owner(pid, payload.get("session_id"), "claude-code"),
+                       unconfigured_branch=f"worktree-{name}")
+        print(result["path"])
+    else:
+        path = payload.get("worktree_path")
+        if not path:
+            raise OrchardError("hook input has no worktree_path")
+        release(Path(path))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="orchard", description="Warm git-worktree pool.")
+    parser.add_argument("--version", action="version", version=f"orchard {__version__}")
+    sub = parser.add_subparsers(dest="command")
+
+    def with_repo(p):
+        p.add_argument("--repo", "--cwd", dest="repo", default=os.getcwd(), help="any directory inside the repo")
+        p.add_argument("--json", action="store_true", help="machine-readable output on stdout")
+        return p
+
+    p = with_repo(sub.add_parser("claim", help="create or reuse a worktree; prints its path"))
+    p.add_argument("name")
+    p.add_argument("--owner-pid", type=int, default=os.getppid(),
+                   help="process whose lifetime marks the worktree as in use (default: the caller)")
+    p.add_argument("--session-id")
+    p.add_argument("--agent", help="the calling agent (pi, claude-code): picks its default worktrees directory and is shown by status")
+    for name, helptext in (("release", "park a worktree back in the pool"),
+                           ("disown", "mark a worktree as no longer used by its owner")):
+        p = sub.add_parser(name, help=helptext)
+        p.add_argument("path")
+        p.add_argument("--json", action="store_true")
+    p = sub.add_parser("run", help="claim, then exec a command inside the worktree")
+    p.add_argument("name")
+    p.add_argument("--repo", default=os.getcwd())
+    p.add_argument("--agent")
+    p = with_repo(sub.add_parser("status", help="list plots"))
+    p.add_argument("--agent", help="report the worktrees directory this agent would get")
+    p = with_repo(sub.add_parser("prune", help="reclaim finished plots of ended sessions"))
+    p.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("hook", help="Claude Code hook adapter (reads hook JSON on stdin)")
+    p.add_argument("event", choices=["claude-create", "claude-remove"])
+
+    argv, command_line = sys.argv[1:] or ["status"], []
+    if argv[0] == "run" and "--" in argv:
+        # argparse.REMAINDER would also swallow run's own options, so split at "--" first.
+        cut = argv.index("--")
+        argv, command_line = argv[:cut], argv[cut + 1:]
+    args = parser.parse_args(argv)
+    args.command_line = command_line
+    handlers = {"claim": cmd_claim, "release": cmd_release, "disown": cmd_disown, "run": cmd_run,
+                "status": cmd_status, "prune": cmd_prune, "hook": cmd_hook}
+    try:
+        handlers[args.command](args)
+    except OrchardError as err:
+        eprint(f"error: {err}")
+        return 1
+    except Exception:  # noqa: BLE001 - surface unexpected failures to the calling agent
+        eprint("unexpected error:\n" + traceback.format_exc())
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+

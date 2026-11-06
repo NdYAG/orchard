@@ -57,11 +57,14 @@ const shared = (key: symbol): Set<string> => (sharedState[key] ??= new Set<strin
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-/** $ORCHARD_BIN, else the CLI shipped in this package, else `orchard` on PATH. */
+/**
+ * $ORCHARD_BIN, else the copy next to this file (the published pi-orchard package carries one), else the
+ * repository's own (running from a checkout or `pi install git:…`), else `orchard` on PATH.
+ */
 function cliCommand(): { cmd: string; prefix: string[] } {
   if (process.env.ORCHARD_BIN) return { cmd: process.env.ORCHARD_BIN, prefix: [] };
-  const bundled = join(HERE, "..", "..", "bin", "orchard");
-  if (existsSync(bundled)) return { cmd: "python3", prefix: [bundled] };
+  const bundled = [join(HERE, "bin", "orchard"), join(HERE, "..", "..", "bin", "orchard")].find((path) => existsSync(path));
+  if (bundled) return { cmd: "python3", prefix: [bundled] };
   return { cmd: "orchard", prefix: [] };
 }
 

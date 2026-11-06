@@ -1,23 +1,32 @@
 {
-  "name": "orchard",
+  "name": "@ndyag/orchard",
   "version": "0.2.0",
-  "private": true,
   "description": "A warm git-worktree pool: new worktrees reuse plots whose dependencies are already prepared.",
-  "keywords": ["pi-package", "worktree", "git", "agent"],
+  "license": "MIT",
+  "author": "Ximing Dai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NdYAG/orchard.git"
+  },
+  "homepage": "https://github.com/NdYAG/orchard#readme",
+  "bugs": {
+    "url": "https://github.com/NdYAG/orchard/issues"
+  },
+  "keywords": ["worktree", "git", "agent", "claude-code"],
   "bin": {
     "orchard": "bin/orchard"
   },
   "pi": {
     "extensions": ["./extensions/pi/index.ts"]
   },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+  "os": ["darwin", "linux"],
+  "publishConfig": {
+    "access": "public"
   },
   "files": [
     "bin/orchard",
-    "extensions",
     "README.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "LICENSE"
   ]
 }

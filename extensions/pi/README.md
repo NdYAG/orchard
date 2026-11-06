@@ -12,12 +12,12 @@ A pi extension that adds `/orchard` and moves your pi session into a worktree fr
 ## Install
 
 ```sh
-pi install npm:<package>              # once published
-pi install git:github.com/<owner>/orchard
-pi -e ./extensions/pi/index.ts        # try it from a checkout
+pi install npm:pi-orchard
+pi install git:github.com/NdYAG/orchard   # or straight from the repository
+pi -e ./extensions/pi/index.ts            # try it from a checkout
 ```
 
-The extension runs the orchard CLI shipped in the same package (`bin/orchard`, needs `python3`). Set `ORCHARD_BIN` to use another one. Worktrees are created in `<repo>/.pi/worktrees` unless the repository sets `worktrees_dir`; add that directory to your `.gitignore`. The repository must be configured in `~/.config/orchard/repos.json`; otherwise `/orchard new` still creates a worktree, just not from the pool.
+The package carries its own copy of the orchard CLI (`bin/orchard`, needs `python3`), which the extension runs. Set `ORCHARD_BIN` to use another one. Worktrees are created in `<repo>/.pi/worktrees` unless the repository sets `worktrees_dir`; add that directory to your `.gitignore`. The repository must be configured in `~/.config/orchard/repos.json`; otherwise `/orchard new` still creates a worktree, just not from the pool.
 
 ## How it works
 
