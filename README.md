@@ -1,4 +1,4 @@
-# orchard
+<h1 align="center">Orchard</h1>
 
 A warm git-worktree pool for coding agents.
 
