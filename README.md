@@ -77,6 +77,7 @@ orchard only pools repositories listed in `~/.config/orchard/repos.json`. The ke
 | `steps[].fingerprint` | Paths whose content decides whether the step must run again. Each is hashed from its git object at the target ref, together with the command itself. |
 | `max_plots` | Upper bound on plots, busy ones included. When every plot is busy, orchard falls back to a plain worktree rather than blocking. Default 4. |
 | `base` | Where new branches start. Default: `origin/HEAD`. |
+| `worktrees_dir` | Where worktrees live, plots and the `.fallow` area included. Understands `~`, `{repo}` (the checkout's directory name) and paths relative to the checkout. Default: `.claude/worktrees`, or `.pi/worktrees` for pi (see below). |
 | `fetch_ttl_minutes` | Don't `git fetch` again within this window. Default 10. |
 
 A step runs again when its fingerprint changed, and so does every step after it. If a step fails part-way, the steps that succeeded stay recorded and the next claim resumes from the failed one.
@@ -84,6 +85,20 @@ A step runs again when its fingerprint changed, and so does every step after it.
 Steps inherit the environment of whoever called orchard, so put anything version-sensitive (for example a Node version on `PATH`) into the command itself. A repository that isn't configured still gets a worktree, just not from the pool.
 
 Monorepos usually want a build step for workspace packages. If a package's `main` points at an unbuilt `lib/`, module resolution can climb out of the worktree into the main checkout and load a second copy of a dependency such as React.
+
+#### Where worktrees live
+
+Each agent has a default location inside the repository:
+
+| Caller | Default |
+|---|---|
+| Claude Code | `.claude/worktrees`, where Claude Code itself puts worktrees |
+| pi (the extension, or `--agent pi`) | `.pi/worktrees` |
+| anything else | `.claude/worktrees` |
+
+Both sit inside the repository, so add them to your `.gitignore`; otherwise `git status` reports `.claude/` or `.pi/` as untracked. Tools that scan the whole repository (test runners, type checkers, IDE indexers) may also pick the worktrees up. A `.pi/` that holds nothing but `worktrees/` does not make pi ask whether to trust the project.
+
+Set `worktrees_dir` to override the default for every caller, for example `"~/worktrees/{repo}"` to keep worktrees out of the project. Use `{repo}` when several repositories share a parent so the same task name in two of them can't collide. The directory must not be, or contain, the repository, and must not be inside `.git`. Without `worktrees_dir`, a plot returned to the pool is parked beside where it was, so the pool follows whichever agent used it last; with it, plots move to the configured location as they are claimed and released.
 
 ## Use
 
@@ -102,12 +117,12 @@ Claude Code only calls `WorktreeRemove` when the model runs `ExitWorktree remove
 /orchard prune [--dry-run]
 ```
 
-pi has no worktree hook. The extension forks your session into the plot's directory and switches to it, which makes pi rebuild its tools and context there. See [extensions/pi/README.md](extensions/pi/README.md).
+Worktrees go to `.pi/worktrees` unless `worktrees_dir` says otherwise. pi has no worktree hook. The extension forks your session into the plot's directory and switches to it, which makes pi rebuild its tools and context there. See [extensions/pi/README.md](extensions/pi/README.md).
 
 ### From the command line
 
 ```sh
-orchard claim feature-x --json     # create or reuse <repo>/.claude/worktrees/feature-x
+orchard claim feature-x --json     # create or reuse <worktrees_dir>/feature-x (--agent pi: under .pi/worktrees)
 orchard run feature-x -- pi        # claim, then exec any command inside it
 orchard release <path>             # return it to the pool (uncommitted work is backed up first)
 orchard disown <path>              # its owner moved on but is still running
@@ -125,7 +140,7 @@ orchard --version
  ─────▶ occupied ───────────────────▶ fallow ─── claim ───▶ occupied
 ```
 
-- **Fallow** plots wait in `<repo>/.claude/worktrees/.fallow/<id>`. Claiming one moves it to `.claude/worktrees/<name>` (dependencies stay in place), creates the branch from `base` without an upstream, and runs only the steps that changed.
+- **Fallow** plots wait in `<worktrees_dir>/.fallow/<id>`. Claiming one moves it to `<worktrees_dir>/<name>` (dependencies stay in place), creates the branch from `base` without an upstream, and runs only the steps that changed.
 - **Releasing** saves uncommitted work under `refs/orchard/backup/<name>-<time>` (not the shared stash), resets the plot, detaches HEAD and parks it. Branches are never deleted.
 - **Ownership is a process**: its pid and start time. A plot whose owner has exited is reclaimed automatically when it is clean and its branch is merged into `base` or its pull request is merged or closed. Otherwise it is marked `stale` and listed with the reason; nothing is touched.
 - **Concurrency**: a file lock covers only picking a plot and updating state. Fetching, installing and building run outside it, so parallel claims don't queue behind each other.
@@ -147,7 +162,7 @@ An installed Claude Code plugin is copied on its own into Claude Code's cache, w
 
 ### Tested
 
-Claude Code 2.1.318 and pi 1.5.0 on macOS. Not yet verified: installing the plugin from a GitHub marketplace (only a local-path marketplace has been exercised), and whether bumping the version updates an installed plugin.
+Claude Code 2.1.318 and pi 1.5.0 on macOS. Worktrees outside the repository (`worktrees_dir`) were exercised with both Claude Code and pi, creating and removing. Not yet verified: installing the plugin from a GitHub marketplace (only a local-path marketplace has been exercised), and whether bumping the version updates an installed plugin.
 
 ## Status
 

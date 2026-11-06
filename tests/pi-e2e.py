@@ -96,9 +96,20 @@ def cli(*args):
     return subprocess.run([sys.executable, str(CLI), *args], capture_output=True, text=True, env=ENV).stdout
 
 
+def set_worktrees_dir(value):
+    """Point the throwaway repo's config at another worktrees directory (None: back to the default)."""
+    path = Path(ENV["ORCHARD_CONFIG"])
+    config = json.loads(path.read_text())
+    entry = config[str(REPO.resolve())]
+    entry.pop("worktrees_dir", None)
+    if value:
+        entry["worktrees_dir"] = value
+    path.write_text(json.dumps(config))
+
+
 def release_leftovers(real_repo):
     """Park worktrees an earlier (possibly aborted) run left behind, so names can be reused."""
-    for leftover in (Path(real_repo) / ".claude/worktrees").glob("pi-*"):
+    for leftover in (Path(real_repo) / ".pi/worktrees").glob("pi-*"):
         cli("release", str(leftover))
 
 
@@ -116,7 +127,7 @@ def main():
     print("1. new: claim a plot and move the session into it")
     pi = Pi(REPO)
     note = pi.say("/orchard new pi-a", "Now in")
-    plot_a = f"{real_repo}/.claude/worktrees/pi-a"
+    plot_a = f"{real_repo}/.pi/worktrees/pi-a"
     check("reports the new worktree", bool(note) and plot_a in note and "branch pi-a" in note, note)
     check("pi's own tools now run inside it", pi.bash("pwd") == plot_a)
     check("branch is checked out", pi.bash("git branch --show-current") == "pi-a")
@@ -148,7 +159,7 @@ def main():
     source.write_text(json.dumps(header) + "\n" + json.dumps(message) + "\n")
     pi = Pi(REPO, session=source)
     check("worktree for the resumed session", bool(pi.say("/orchard new pi-c", "Now in")))
-    sessions_dir = Path.home() / ".pi/agent/sessions" / ("--" + f"{real_repo}/.claude/worktrees/pi-c".strip("/").replace("/", "-") + "--")
+    sessions_dir = Path.home() / ".pi/agent/sessions" / ("--" + f"{real_repo}/.pi/worktrees/pi-c".strip("/").replace("/", "-") + "--")
     moved = sorted(sessions_dir.glob("*.jsonl")) if sessions_dir.exists() else []
     check("a session file exists for the plot", bool(moved), str(sessions_dir))
     check("it holds the original message", bool(moved) and "carry me along" in moved[-1].read_text())
@@ -158,7 +169,7 @@ def main():
     print("5. a worktree outside the pool asks before it is removed")
     pi = Pi(OTHER, confirm=False)
     note = pi.say("/orchard new pi-u", "Now in")
-    plain = f"{OTHER.resolve()}/.claude/worktrees/pi-u"
+    plain = f"{OTHER.resolve()}/.pi/worktrees/pi-u"
     check("created but not pooled", bool(note) and "not pooled" in note, note)
     pi.say("/orchard done", "\0", timeout=6)  # declined: no notification follows, so just wait
     check("done asked for confirmation", pi.dialogs == ["Remove worktree?"], pi.dialogs)
@@ -168,6 +179,23 @@ def main():
     note = pi.say("/orchard done", "Back in")
     check("confirming removes the worktree", bool(note) and "removed" in note and not Path(plain).exists(), note)
     pi.stop()
+
+    print("6. worktrees_dir keeps worktrees outside the repository")
+    outside = f"{(T / 'outside-pi').resolve()}/repo"
+    set_worktrees_dir(f"{T}/outside-pi/{{repo}}")
+    try:
+        pi = Pi(REPO)
+        note = pi.say("/orchard new pi-d", "Now in")
+        check("created in the configured directory", bool(note) and f"{outside}/pi-d" in note, note)
+        check("pi's tools run there", pi.bash("pwd") == f"{outside}/pi-d")
+        table = pi.say("/orchard status", "pi-d") or ""
+        check("status from there still finds the repository", "occupied" in table and outside in table, table)
+        note = pi.say("/orchard done", "Back in")
+        check("done returns to the main checkout", bool(note) and real_repo in note and "returned to the pool" in note, note)
+        check("the plot is parked under <dir>/.fallow", (Path(outside) / ".fallow").exists() and not Path(f"{outside}/pi-d").exists())
+        pi.stop()
+    finally:
+        set_worktrees_dir(None)
 
     release_leftovers(real_repo)  # pi-a stays occupied by design: it was left without `done`
     for stale in (Path.home() / ".pi/agent/sessions").glob("--private-tmp-orchard-test-*"):

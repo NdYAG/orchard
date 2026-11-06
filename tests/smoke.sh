@@ -133,7 +133,7 @@ for n in 1 2 3 4; do python3 "$ORCHARD" release "$(cat "$T/e$n.out")" >/dev/null
 J=$(python3 "$ORCHARD" claim g1 --repo "$R" --owner-pid $$ --agent pi --json 2>/dev/null)
 field() { python3 -c "import json,sys; print(json.loads(sys.argv[1])$2)" "$1"; }
 G1=$(field "$J" "['path']")
-check "claim --json gives the path" test "$G1" = "$R/.claude/worktrees/g1"
+check "claim --agent pi lands in .pi/worktrees" test "$G1" = "$R/.pi/worktrees/g1"
 check "claim --json says it was pooled" test "$(field "$J" "['pooled']")" = True
 S=$(python3 "$ORCHARD" status --repo "$R" --json)
 check "status --json records the agent" grep -q '"agent": "pi"' <<<"$S"
@@ -148,6 +148,62 @@ OWNER=$(python3 -c "import json,glob; p=json.load(open(glob.glob('$ORCHARD_CACHE
 check "run makes the exec'd process the owner" test "$OWNER" = "${RUN##*|}"
 R2=$(python3 "$ORCHARD" release "$R/.claude/worktrees/h1" --json)
 check "release --json reports fallow" test "$(field "$R2" "['action']")" = fallow
+
+echo "12. worktrees_dir: keep worktrees outside the repository"
+setting() { # worktrees_dir value, or "-" to remove the key
+  python3 - "$ORCHARD_CONFIG" "$R" "$1" <<'PY'
+import json, sys
+path, root, value = sys.argv[1:]
+cfg = json.load(open(path))
+if value == "-":
+    cfg[root].pop("worktrees_dir", None)
+else:
+    cfg[root]["worktrees_dir"] = value
+json.dump(cfg, open(path, "w"))
+PY
+}
+mkdir -p "$T/outside"; OUTSIDE="$(cd "$T/outside" && pwd -P)/repo"
+setting "$T/outside/{repo}"
+J=$(python3 "$ORCHARD" claim k1 --repo "$R" --owner-pid $$ --json 2>/dev/null); K1=$(field "$J" "['path']")
+check "claim lands in the configured directory ({repo} expanded)" test "$K1" = "$OUTSIDE/k1"
+check "a plot moved there is a normal checkout of the branch" test "$(git -C "$K1" branch --show-current)" = k1
+S=$(python3 "$ORCHARD" status --repo "$K1" --json)
+check "status finds the repository from inside that worktree" test "$(field "$S" "['root']")" = "$R"
+check "status reports the directory" test "$(field "$S" "['worktrees_dir']")" = "$OUTSIDE"
+python3 "$ORCHARD" release "$K1" >/dev/null 2>&1
+check "release parks it under <dir>/.fallow" bash -c "test -d '$OUTSIDE/.fallow' && test ! -e '$K1'"
+GONE=$(python3 "$ORCHARD" release "$OUTSIDE/gone" --json)
+check "releasing a path that is already gone is a no-op" test "$(field "$GONE" "['action']")" = absent
+check "disowning one is too" test "$(field "$(python3 "$ORCHARD" disown "$OUTSIDE/gone" --json)" "['plot']")" = None
+J=$(python3 "$ORCHARD" claim k2 --repo "$R" --owner-pid $$ --agent pi --json 2>/dev/null)
+check "worktrees_dir overrides an agent's default" test "$(field "$J" "['path']")" = "$OUTSIDE/k2"
+python3 "$ORCHARD" release "$OUTSIDE/k2" >/dev/null 2>&1
+setting ".trees"
+check "a relative setting is relative to the checkout" test "$(field "$(python3 "$ORCHARD" status --repo "$R" --json)" "['worktrees_dir']")" = "$R/.trees"
+setting ".."
+check "a directory that contains the repository is refused" bash -c "! python3 '$ORCHARD' status --repo '$R' >/dev/null 2>&1"
+setting ".git/worktrees-x"
+check "a directory inside .git is refused" bash -c "! python3 '$ORCHARD' status --repo '$R' >/dev/null 2>&1"
+setting "-"
+
+echo "13. each agent gets its own default directory"
+git clone -q "$T/origin.git" "$T/pionly" 2>/dev/null; PO=$(cd "$T/pionly" && pwd -P)
+python3 - "$ORCHARD_CONFIG" "$PO" <<'PY'
+import json, sys
+path, root = sys.argv[1:]
+cfg = json.load(open(path)); cfg[root] = {"max_plots": 2, "fetch_ttl_minutes": 0}; json.dump(cfg, open(path, "w"))
+PY
+J=$(python3 "$ORCHARD" claim x1 --repo "$PO" --owner-pid $$ --agent pi --json 2>/dev/null)
+check "pi's default is <repo>/.pi/worktrees" test "$(field "$J" "['path']")" = "$PO/.pi/worktrees/x1"
+python3 "$ORCHARD" release "$PO/.pi/worktrees/x1" >/dev/null 2>&1
+python3 "$ORCHARD" status --repo "$PO" >/dev/null
+python3 "$ORCHARD" prune --repo "$PO" >/dev/null
+check "a release that names no agent parks the plot where it was" test -d "$PO/.pi/worktrees/.fallow"
+check "no .claude directory appears in a pi-only repository" test ! -e "$PO/.claude"
+J=$(python3 "$ORCHARD" claim x2 --repo "$PO" --owner-pid $$ --agent claude --json 2>/dev/null)
+check "claude's default is <repo>/.claude/worktrees; the pooled plot moves there" test "$(field "$J" "['path']")" = "$PO/.claude/worktrees/x2"
+python3 "$ORCHARD" release "$PO/.claude/worktrees/x2" >/dev/null 2>&1
+check "and is parked beside it afterwards" test -d "$PO/.claude/worktrees/.fallow"
 
 echo
 python3 "$ORCHARD" status --repo "$R"

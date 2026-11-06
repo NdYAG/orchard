@@ -2,7 +2,8 @@
 """orchard: a warm git-worktree pool, usable from any agent or shell.
 
 Core commands (agent-neutral):
-  claim <name>         create or reuse <repo>/.claude/worktrees/<name>; prints its path (or JSON).
+  claim <name>         create or reuse <worktrees_dir>/<name>; prints its path. The directory defaults to
+                       <repo>/.claude/worktrees (Claude Code) or <repo>/.pi/worktrees (--agent pi).
   release <path>       park a pooled worktree as fallow instead of deleting it.
   disown <path>        the owner moved on but is still alive; let reclaim judge the worktree.
   run <name> -- cmd    claim, then exec cmd inside the worktree (cmd becomes the owner).
@@ -37,6 +38,10 @@ CACHE_ROOT = Path(os.environ.get("ORCHARD_CACHE_DIR")
 CONFIG_PATH = Path(os.environ.get("ORCHARD_CONFIG")
                    or Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "orchard" / "repos.json")
 DEFAULTS = {"fingerprint": [], "prepare": "", "max_plots": 4, "base": "", "fetch_ttl_minutes": 10}
+# Where each agent keeps worktrees by default (Claude Code's own location for its users). A caller that
+# says nothing, or something unknown, gets the first; `worktrees_dir` in the config overrides all of them.
+DEFAULT_WORKTREES_DIR = ".claude/worktrees"
+AGENT_WORKTREES_DIRS = {"claude-code": ".claude/worktrees", "claude": ".claude/worktrees", "pi": ".pi/worktrees"}
 FALLOW = ".fallow"
 STALE_RECHECK_SECONDS = 600
 # Claude Code's own worktree lock reason, e.g. "claude session foo (pid 123 start Tue Nov  3 06:15:21 2026)".
@@ -86,13 +91,6 @@ def alive(pid: int | None, started: str | None) -> bool:
     return current is not None and started is not None and current == " ".join(started.split())
 
 
-def existing_ancestor(path: Path) -> Path:
-    for candidate in [path, *path.parents]:
-        if candidate.is_dir():
-            return candidate
-    return Path("/")
-
-
 def worktree_list(cwd) -> list[dict]:
     entries: list[dict] = []
     for line in git(cwd, "worktree", "list", "--porcelain").splitlines():
@@ -113,15 +111,36 @@ def same_path(a, b) -> bool:
 
 # ---------------------------------------------------------------- repository + config
 
+def resolve_worktrees_dir(root: Path, setting: str | None, agent: str | None = None) -> Path:
+    """`~`, `{repo}` (the checkout's directory name) and paths relative to the checkout are understood."""
+    raw = (setting or AGENT_WORKTREES_DIRS.get(agent or "", DEFAULT_WORKTREES_DIR)).replace("{repo}", root.name)
+    path = Path(os.path.expanduser(raw))
+    path = Path(os.path.realpath(path if path.is_absolute() else root / path))
+    git_dir = root / ".git"
+    if path == root or path in root.parents:
+        raise OrchardError(f"worktrees_dir {raw!r} is the repository or contains it")
+    if path == git_dir or git_dir in path.parents:
+        raise OrchardError(f"worktrees_dir {raw!r} is inside .git")
+    return path
+
+
 class Repo:
-    def __init__(self, cwd):
+    def __init__(self, cwd, agent: str | None = None):
         top = git(cwd, "rev-parse", "--show-toplevel")
         self.root = Path(os.path.realpath(worktree_list(top)[0]["path"]))
         digest = hashlib.sha256(str(self.root).encode()).hexdigest()[:16]
         self.state_dir = CACHE_ROOT / f"{self.root.name}-{digest}"
-        self.worktrees_dir = self.root / ".claude" / "worktrees"
-        self.fallow_dir = self.worktrees_dir / FALLOW
         self.config = load_config(self.root)
+        self.worktrees_dir = resolve_worktrees_dir(self.root, (self.config or {}).get("worktrees_dir"), agent)
+        self.fallow_dir = self.worktrees_dir / FALLOW
+
+    def fallow_dir_for(self, path) -> Path:
+        """Where to park `path`: the configured directory if there is one, else beside where it sits now, so a
+        command that doesn't know the agent (a manual `release`, `prune`) can't strew plots over several defaults."""
+        if (self.config or {}).get("worktrees_dir"):
+            return self.fallow_dir
+        here = Path(path).parent
+        return here if here.name == FALLOW else here / FALLOW
 
     def log(self, msg: str, **ctx) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -262,9 +281,10 @@ def to_fallow(repo: Repo, path: Path, plot_id: str, name: str, backup: bool) -> 
         git(path, "reset", "--hard", "--quiet")
         git(path, "clean", "-fd", "--quiet")
     git(path, "switch", "--detach", "--quiet")
-    dest = repo.fallow_dir / plot_id
+    park = repo.fallow_dir_for(path)
+    dest = park / plot_id
     if not same_path(path, dest):
-        repo.fallow_dir.mkdir(parents=True, exist_ok=True)
+        park.mkdir(parents=True, exist_ok=True)
         git(repo.root, "worktree", "move", str(path), str(dest))
     return dest
 
@@ -430,8 +450,8 @@ def validate_name(name: str | None) -> str:
 
 
 def claim(repo_dir, name: str, owner: dict, unconfigured_branch: str | None = None) -> dict:
-    """Put a worktree named `name` at <repo>/.claude/worktrees/<name>, served from the pool when configured."""
-    repo = Repo(repo_dir)
+    """Put a worktree named `name` at <worktrees_dir>/<name>, served from the pool when configured."""
+    repo = Repo(repo_dir, agent=owner.get("agent"))
     target = repo.worktrees_dir / validate_name(name)
     if target.exists():
         raise OrchardError(f"{target} already exists")
@@ -477,6 +497,7 @@ def claim(repo_dir, name: str, owner: dict, unconfigured_branch: str | None = No
             add_plain_worktree(repo, target, branch, exists, base)
         else:
             repo.unlock(plot["path"])
+            target.parent.mkdir(parents=True, exist_ok=True)  # `worktree move` won't create it (a new worktrees_dir)
             git(repo.root, "worktree", "move", plot["path"], str(target))
             switch_branch(target, branch, exists, base)
         for step in to_run:
@@ -520,13 +541,15 @@ def claim(repo_dir, name: str, owner: dict, unconfigured_branch: str | None = No
 
 def release(path: Path) -> dict:
     """Park a pooled worktree as fallow (backing up uncommitted work); remove an unpooled one."""
-    repo = Repo(existing_ancestor(path))
+    if not path.exists():
+        # Nothing to park; a stale pool entry is dropped by the next claim. Also keeps this from needing a
+        # repository to run in: the worktree may live outside it and be gone.
+        return {"action": "absent", "plot": None, "path": None}
+    repo = Repo(path)
     with locked_pool(repo) as pool:
         plot = next((p for p in pool["plots"] if p.get("path") and same_path(p["path"], path)), None)
         snapshot = dict(plot) if plot else None
     if snapshot is None:
-        if not path.exists():
-            return {"action": "absent", "plot": None, "path": None}
         repo.unlock(path)
         git(repo.root, "worktree", "remove", "--force", str(path))
         return {"action": "removed", "plot": None, "path": None}
@@ -543,7 +566,9 @@ def release(path: Path) -> dict:
 
 def disown(path: Path) -> dict:
     """The owner left this worktree but lives on: let reclaim judge it as if its session had ended."""
-    repo = Repo(existing_ancestor(path))
+    if not path.exists():
+        return {"plot": None}
+    repo = Repo(path)
     with locked_pool(repo) as pool:
         plot = next((p for p in pool["plots"] if p.get("path") and same_path(p["path"], path)), None)
         if plot is None:
@@ -609,15 +634,15 @@ def cmd_run(args) -> None:
 
 
 def cmd_status(args) -> None:
-    repo = Repo(args.repo)
+    repo = Repo(args.repo, agent=args.agent)
     if repo.config is None:
-        emit({"configured": False, "root": str(repo.root), "plots": []}, args.json,
-             f"{repo.root} is not configured in {CONFIG_PATH}; worktrees are created the default way.")
+        emit({"configured": False, "root": str(repo.root), "worktrees_dir": str(repo.worktrees_dir), "plots": []},
+             args.json, f"{repo.root} is not configured in {CONFIG_PATH}; worktrees are created the default way.")
         return
     rows = plot_rows(repo)
     if args.json:
-        print(json.dumps({"configured": True, "root": str(repo.root), "base": repo.base(),
-                          "max_plots": repo.config["max_plots"], "plots": rows}))
+        print(json.dumps({"configured": True, "root": str(repo.root), "worktrees_dir": str(repo.worktrees_dir),
+                          "base": repo.base(), "max_plots": repo.config["max_plots"], "plots": rows}))
         return
     table = [("ID", "STATE", "NAME", "BRANCH", "VS BASE", "NOTE")]
     for r in rows:
@@ -626,7 +651,7 @@ def cmd_status(args) -> None:
     widths = [max(len(str(row[i])) for row in table) for i in range(len(table[0]))]
     for row in table:
         print("  ".join(str(v).ljust(w) for v, w in zip(row, widths)).rstrip())
-    print(f"\n{len(rows)}/{repo.config['max_plots']} plots · steps vs {repo.base()} · * = session ended")
+    print(f"\n{len(rows)}/{repo.config['max_plots']} plots in {repo.worktrees_dir} · steps vs {repo.base()} · * = session ended")
 
 
 def cmd_prune(args) -> None:
@@ -683,7 +708,7 @@ def main() -> int:
     p.add_argument("--owner-pid", type=int, default=os.getppid(),
                    help="process whose lifetime marks the worktree as in use (default: the caller)")
     p.add_argument("--session-id")
-    p.add_argument("--agent", help="label recorded for status, e.g. pi")
+    p.add_argument("--agent", help="the calling agent (pi, claude-code): picks its default worktrees directory and is shown by status")
     for name, helptext in (("release", "park a worktree back in the pool"),
                            ("disown", "mark a worktree as no longer used by its owner")):
         p = sub.add_parser(name, help=helptext)
@@ -693,7 +718,8 @@ def main() -> int:
     p.add_argument("name")
     p.add_argument("--repo", default=os.getcwd())
     p.add_argument("--agent")
-    with_repo(sub.add_parser("status", help="list plots"))
+    p = with_repo(sub.add_parser("status", help="list plots"))
+    p.add_argument("--agent", help="report the worktrees directory this agent would get")
     p = with_repo(sub.add_parser("prune", help="reclaim finished plots of ended sessions"))
     p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("hook", help="Claude Code hook adapter (reads hook JSON on stdin)")

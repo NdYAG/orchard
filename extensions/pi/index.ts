@@ -30,6 +30,7 @@ interface Plot {
 interface RepoStatus {
   configured: boolean;
   root: string;
+  worktrees_dir: string;
   plots: Plot[];
 }
 
@@ -112,16 +113,16 @@ const isInside = (dir: string, root: string): boolean => {
 };
 
 async function readStatus(dir: string): Promise<RepoStatus> {
-  const result = await runCli(["status", "--repo", dir, "--json"]);
+  const result = await runCli(["status", "--repo", dir, "--agent", "pi", "--json"]);
   if (result.code !== 0) throw new Error(diagnostics(result.stderr) || result.stderr.trim().split("\n").pop() || "orchard status failed");
   return JSON.parse(result.stdout) as RepoStatus;
 }
 
-/** The worktree `dir` is in: a pooled plot, or a plain worktree orchard created under .claude/worktrees. */
+/** The worktree `dir` is in: a pooled plot, or a plain worktree orchard created in the repo's worktrees directory. */
 function locateWorktree(status: RepoStatus, dir: string): { path: string; pooled: boolean } | undefined {
   const plot = status.plots.find((p) => p.path && p.state !== "fallow" && isInside(dir, p.path));
   if (plot?.path) return { path: plot.path, pooled: true };
-  const worktrees = join(status.root, ".claude", "worktrees");
+  const worktrees = status.worktrees_dir;
   if (!isInside(dir, worktrees)) return undefined;
   const name = real(dir).slice(real(worktrees).length + 1).split(sep)[0];
   if (!name || name.startsWith(".")) return undefined;
@@ -281,7 +282,7 @@ export default function (pi: ExtensionAPI) {
       const [sub = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
       if (sub === "new") await newWorktree(ctx, rest[0] ?? "");
       else if (sub === "done") await doneWithWorktree(ctx);
-      else if (sub === "status") await showCli(ctx, ["status"]);
+      else if (sub === "status") await showCli(ctx, ["status", "--agent", "pi"]);
       else if (sub === "prune") await showCli(ctx, ["prune", ...rest]);
       else ctx.ui.notify(HELP, "info");
     },

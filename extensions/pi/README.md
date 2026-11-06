@@ -17,7 +17,7 @@ pi install git:github.com/<owner>/orchard
 pi -e ./extensions/pi/index.ts        # try it from a checkout
 ```
 
-The extension runs the orchard CLI shipped in the same package (`bin/orchard`, needs `python3`). Set `ORCHARD_BIN` to use another one. The repository must be configured in `~/.config/orchard/repos.json`; otherwise `/orchard new` still creates a worktree, just not from the pool.
+The extension runs the orchard CLI shipped in the same package (`bin/orchard`, needs `python3`). Set `ORCHARD_BIN` to use another one. Worktrees are created in `<repo>/.pi/worktrees` unless the repository sets `worktrees_dir`; add that directory to your `.gitignore`. The repository must be configured in `~/.config/orchard/repos.json`; otherwise `/orchard new` still creates a worktree, just not from the pool.
 
 ## How it works
 
