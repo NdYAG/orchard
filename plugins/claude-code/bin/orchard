@@ -568,6 +568,7 @@ def plot_rows(repo: Repo) -> list[dict]:
             "id": plot["id"], "state": plot["state"], "session_ended": ended,
             "name": None if parked else plot.get("name"), "branch": None if parked else plot.get("branch"),
             "path": plot.get("path"), "agent": (plot.get("owner") or {}).get("agent"),
+            "owner_pid": (plot.get("owner") or {}).get("pid"),
             "pending_steps": [s["name"] for s in steps_to_run(repo.config, plot.get("steps"), want)],
             "note": (plot.get("stale") or {}).get("reason") or plot.get("error"),
         })

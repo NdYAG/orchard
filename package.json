@@ -7,6 +7,13 @@
   "bin": {
     "orchard": "bin/orchard"
   },
+  "pi": {
+    "extensions": ["./extensions/pi/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
   "files": [
     "bin/orchard",
     "extensions",

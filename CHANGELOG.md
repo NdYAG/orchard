@@ -2,7 +2,8 @@
 
 ## 0.2.0
 
-- Split into an agent-neutral CLI (`bin/orchard`) and adapters: the Claude Code plugin (`plugins/claude-code`); the pi extension (`extensions/pi`) is not written yet.
+- Split into an agent-neutral CLI (`bin/orchard`) and adapters: the Claude Code plugin (`plugins/claude-code`) and the pi extension (`extensions/pi`: `/orchard new | done | status | prune`).
+- `status --json` reports each plot's `owner_pid`.
 - CLI: `claim`, `release`, `disown`, `run`, `status`, `prune` with `--json`; `hook claude-create|claude-remove` for Claude Code; `--version`.
 - The Claude Code plugin bundles its own copy of the CLI and is installable from the repo as a marketplace.
 - Preparation is a list of fingerprinted `steps`; only the first changed step and those after it re-run.
