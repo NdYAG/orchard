@@ -1,0 +1,9 @@
+#!/bin/sh
+# Locate the orchard CLI: explicit override, then the copy bundled in this plugin (an installed
+# plugin is copied alone into Claude Code's cache, so it cannot reach the repo root), then PATH.
+here="$(cd "$(dirname "$0")" && pwd)"
+if [ -n "$ORCHARD_BIN" ]; then exec "$ORCHARD_BIN" "$@"; fi
+if [ -f "$here/orchard" ]; then exec python3 "$here/orchard" "$@"; fi
+if command -v orchard >/dev/null 2>&1; then exec orchard "$@"; fi
+echo "[orchard] CLI not found next to $0 or on PATH; set ORCHARD_BIN" >&2
+exit 1

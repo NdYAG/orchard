@@ -1,0 +1,21 @@
+{
+  "name": "orchard",
+  "owner": {
+    "name": "Ximing Dai"
+  },
+  "metadata": {
+    "description": "A warm git-worktree pool for Claude Code: new worktrees reuse plots whose dependencies are already prepared.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "orchard",
+      "description": "Warm git-worktree pool: new Claude Code worktrees reuse plots whose dependencies are already installed.",
+      "version": "0.2.0",
+      "author": {
+        "name": "Ximing Dai"
+      },
+      "source": "./plugins/claude-code"
+    }
+  ]
+}

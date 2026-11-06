@@ -1,0 +1,5 @@
+__pycache__/
+*.bak
+.DS_Store
+# Scripts wired to a private repo (hard-coded paths); keep them out of published history.
+tests/local/
